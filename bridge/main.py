@@ -159,11 +159,19 @@ def panel():
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#888;white-space:pre-wrap">debug: panel v4 loaded, no messages yet</div>
 <script>
 let ctx = null;
+let msgCount = 0, fetchCount = 0;
+function dbg(extra) {
+  document.getElementById("debug").textContent =
+    "debug: panel v4, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+}
 window.addEventListener("message", function (e) {
+  msgCount++;
   try {
     const d = (typeof e.data === "string") ? JSON.parse(e.data) : e.data;
+    dbg("last message: " + String(typeof e.data === "string" ? e.data : JSON.stringify(e.data)).slice(0, 160));
     if (d && d.event === "appContext") {
       ctx = d.data;
       const c = ctx.conversation || {};
@@ -179,7 +187,7 @@ window.addEventListener("message", function (e) {
     }
   } catch (_) {}
 });
-function askContext() { window.parent.postMessage("chatwoot-dashboard-app:fetch-info", "*"); }
+function askContext() { fetchCount++; dbg(); window.parent.postMessage("chatwoot-dashboard-app:fetch-info", "*"); }
 askContext();
 window._fetchTimer = setInterval(function () { if (!ctx) askContext(); }, 2000);
 async function poll() {
