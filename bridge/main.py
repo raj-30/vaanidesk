@@ -156,16 +156,18 @@ def panel():
 <!doctype html><html><body style="font-family:sans-serif;padding:12px">
 <h3 style="margin:0 0 8px">AI Voice Call</h3>
 <div id="who">Waiting for conversation context...</div>
+<label style="display:block;margin-top:10px;font-size:13px">Customer phone (type it in if the chat channel has no number, e.g. Telegram):
+<input id="phoneIn" type="tel" placeholder="+91XXXXXXXXXX" style="display:block;margin-top:4px;padding:8px;width:90%;font-size:15px"></label>
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#888;white-space:pre-wrap">debug: panel v4 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#888;white-space:pre-wrap">debug: panel v5 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v4, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v5, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
@@ -181,12 +183,19 @@ window.addEventListener("message", function (e) {
       ctx._accountId = c.account_id || 1;
       document.getElementById("who").textContent =
         "Customer: " + (ctx._name || "-") + "  Phone: " + (ctx._phone || "-");
-      document.getElementById("callBtn").disabled = !ctx._phone;
+      const pin = document.getElementById("phoneIn");
+      if (ctx._phone && !pin.value) pin.value = ctx._phone;
+      updateBtn();
       if (window._fetchTimer) { clearInterval(window._fetchTimer); window._fetchTimer = null; }
       poll();
     }
   } catch (_) {}
 });
+function updateBtn() {
+  const v = document.getElementById("phoneIn").value.trim();
+  document.getElementById("callBtn").disabled = !(ctx && v.length >= 10);
+}
+document.getElementById("phoneIn").addEventListener("input", updateBtn);
 function askContext() { fetchCount++; dbg(); window.parent.postMessage("chatwoot-dashboard-app:fetch-info", "*"); }
 askContext();
 window._fetchTimer = setInterval(function () { if (!ctx) askContext(); }, 2000);
@@ -203,7 +212,7 @@ document.getElementById("callBtn").onclick = async () => {
   document.getElementById("result").textContent = "Starting call...";
   const r = await fetch("/trigger-call", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({conversation_id: c.id, account_id: ctx._accountId || 1,
-      phone: ctx._phone, name: ctx._name || "Customer"})});
+      phone: document.getElementById("phoneIn").value.trim(), name: ctx._name || "Customer"})});
   const j = await r.json();
   document.getElementById("result").textContent =
     j.attempt_id ? ("Call started. Attempt: " + j.attempt_id + "\nResult will appear here and as a private note in the chat.") : JSON.stringify(j);
