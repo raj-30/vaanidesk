@@ -153,21 +153,27 @@ def panel():
     It appears as a tab inside every conversation.
     Chatwoot sends conversation+contact context via postMessage."""
     return r"""
-<!doctype html><html><body style="font-family:sans-serif;padding:12px">
-<h3 style="margin:0 0 8px">AI Voice Call</h3>
+<!doctype html><html><body style="font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding:14px;background:#141517;color:#ececf1;margin:0">
+<style>
+button { background:#1f93ff; color:#fff; border:0; border-radius:6px; cursor:pointer; }
+button:disabled { background:#33343a; color:#8e8f96; cursor:not-allowed; }
+input { background:#1e1f23; color:#ececf1; border:1px solid #34363c; border-radius:6px; outline:none; }
+input:focus { border-color:#1f93ff; }
+</style>
+<h3 style="margin:0 0 8px;font-size:16px">AI Voice Call</h3>
 <div id="who">Waiting for conversation context...</div>
-<label style="display:block;margin-top:10px;font-size:13px">Customer phone (type it in if the chat channel has no number, e.g. Telegram):
-<input id="phoneIn" type="tel" placeholder="+91XXXXXXXXXX" style="display:block;margin-top:4px;padding:8px;width:90%;font-size:15px"></label>
+<label style="display:block;margin-top:10px;font-size:13px;color:#c9cacf">Customer phone (type it in if the chat channel has no number, e.g. Telegram):
+<input id="phoneIn" type="tel" placeholder="+91XXXXXXXXXX" style="display:block;margin-top:4px;padding:8px;width:92%;font-size:15px;box-sizing:border-box"></label>
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#888;white-space:pre-wrap">debug: panel v6 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v7 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v6, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v7, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
