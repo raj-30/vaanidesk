@@ -167,13 +167,13 @@ input:focus { border-color:#1f93ff; }
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v7 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v8 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v7, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v8, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
@@ -219,9 +219,12 @@ document.getElementById("callBtn").onclick = async () => {
   const r = await fetch("/trigger-call", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({conversation_id: c.id, account_id: ctx._accountId || 1,
       phone: document.getElementById("phoneIn").value.trim(), name: ctx._name || "Customer"})});
-  const j = await r.json();
+  const t = await r.text();
+  let j = {};
+  try { j = JSON.parse(t); } catch (_) { j = {error: "Bridge returned an unreadable response (HTTP " + r.status + "): " + t.slice(0, 200)}; }
   document.getElementById("result").textContent =
-    j.attempt_id ? ("Call started. Attempt: " + j.attempt_id + "\nResult will appear here and as a private note in the chat.") : JSON.stringify(j);
+    j.attempt_id ? ("Call started. Attempt: " + j.attempt_id + "\nResult will appear here and as a private note in the chat.")
+                 : ("Call NOT started. " + (j.error || JSON.stringify(j)) + (j.sarvam_detail ? "\nSarvam said: " + j.sarvam_detail : ""));
   setTimeout(poll, 5000);
 };
 </script></body></html>
@@ -239,7 +242,18 @@ async def trigger_call(req: Request):
     chat_context = cw_get_chat_context(account_id, conversation_id)
     variables = {"customer_name": data.get("name") or "Customer",
                  "chat_context": chat_context or "No previous chat messages were available."}
-    attempt_id = start_sarvam_call(phone, conversation_id, variables, account_id)
+    try:
+        attempt_id = start_sarvam_call(phone, conversation_id, variables, account_id)
+    except requests.HTTPError as e:
+        detail = ""
+        try:
+            detail = (e.response.text or "")[:400]
+        except Exception:
+            pass
+        return {"error": f"Sarvam API rejected the call request (HTTP {e.response.status_code}).",
+                "sarvam_detail": detail}
+    except requests.RequestException as e:
+        return {"error": f"Could not reach the Sarvam API: {e}"}
     cw_post_note(account_id, conversation_id,
                  f"AI call started to {phone} from dashboard button. Attempt: {attempt_id}")
     cw_add_labels(account_id, conversation_id, ["call-started"])
