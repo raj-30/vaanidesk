@@ -8,6 +8,10 @@ Flow:
   Bridge --> Chatwoot API: private note + label on the same conversation
 """
 import os
+import threading
+import time
+from urllib.parse import quote
+
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -35,6 +39,62 @@ def cw_post_note(account_id: int, conversation_id: int, content: str):
     r = requests.post(url, headers=CW_HEADERS, json={"content": content, "private": True}, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def fetch_recording_bytes(interaction_id: str, attempts: int = 8, delay: int = 15):
+    """Download the call recording (WAV) from Sarvam's Analytics API.
+    The stitched recording is produced after hangup and may not exist
+    the moment the webhook fires, so retry for a few minutes."""
+    url = (f"https://apps.sarvam.ai/api/analytics/v1/{SARVAM_ORG}/{SARVAM_WS}/"
+           f"{SARVAM_APP_ID}/recordings/{quote(str(interaction_id), safe='')}")
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers={"X-API-Key": SARVAM_KEY}, timeout=60)
+            if r.status_code == 200 and r.content:
+                return r.content
+            print(f"[recording] attempt {i + 1}: HTTP {r.status_code}, retrying")
+        except requests.RequestException as e:
+            print(f"[recording] attempt {i + 1} failed: {e}")
+        if i < attempts - 1:
+            time.sleep(delay)
+    return None
+
+
+def cw_post_note_with_audio(account_id: int, conversation_id: int, content: str,
+                            wav_bytes: bytes, filename: str):
+    """Post a private note with an audio file attached, so the recording
+    lives inside the Chatwoot conversation itself."""
+    url = f"{CHATWOOT_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+    files = {"attachments[]": (filename, wav_bytes, "audio/wav")}
+    form = {"content": content, "private": "true"}
+    r = requests.post(url, headers={"api_access_token": CHATWOOT_TOKEN},
+                      data=form, files=files, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def attach_recording_later(account_id: int, conversation_id: int, interaction_id: str):
+    """Background thread: wait for Sarvam to finish stitching the
+    recording, download it, and attach it to the conversation."""
+    time.sleep(20)
+    wav = fetch_recording_bytes(interaction_id)
+    if not wav:
+        print(f"[recording] giving up for conversation {conversation_id}: "
+              "recording never became available")
+        return
+    try:
+        cw_post_note_with_audio(
+            account_id, conversation_id,
+            "Call recording attached (customer on the left channel, "
+            "agent on the right channel).",
+            wav, f"vaanidesk-call-{conversation_id}.wav")
+        result = CALL_RESULTS.get(int(conversation_id))
+        if result is not None:
+            result["summary"] = (result.get("summary") or "") + \
+                "\n\nRecording: attached in this conversation."
+        print(f"[recording] attached to conversation {conversation_id}")
+    except Exception as e:
+        print(f"[recording] upload to Chatwoot failed: {e}")
 
 
 def cw_add_labels(account_id: int, conversation_id: int, labels: list[str]):
@@ -213,6 +273,11 @@ async def sarvam_webhook(req: Request):
     }
     cw_post_note(account_id, int(conversation_id), summary)
     cw_add_labels(account_id, int(conversation_id), [f"call-{status}"])
+    interaction_id = data.get("interaction_id")
+    if interaction_id:
+        threading.Thread(target=attach_recording_later,
+                         args=(account_id, int(conversation_id), interaction_id),
+                         daemon=True).start()
     return {"ok": True}
 
 
@@ -237,13 +302,13 @@ input:focus { border-color:#1f93ff; }
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v9 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v10 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v9, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v10, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
