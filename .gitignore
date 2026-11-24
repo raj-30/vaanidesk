@@ -1,0 +1,7 @@
+# Secrets and local runtime files - never commit these
+.env
+bridge/.env
+venv/
+bridge/venv/
+__pycache__/
+*.deb
