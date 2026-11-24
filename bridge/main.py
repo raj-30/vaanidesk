@@ -152,7 +152,7 @@ def panel():
     Chatwoot: Settings > Integrations > Dashboard Apps > Add.
     It appears as a tab inside every conversation.
     Chatwoot sends conversation+contact context via postMessage."""
-    return """
+    return r"""
 <!doctype html><html><body style="font-family:sans-serif;padding:12px">
 <h3 style="margin:0 0 8px">AI Voice Call</h3>
 <div id="who">Waiting for conversation context...</div>
@@ -161,13 +161,13 @@ def panel():
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#888;white-space:pre-wrap">debug: panel v5 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#888;white-space:pre-wrap">debug: panel v6 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v5, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v6, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
