@@ -116,11 +116,84 @@ async def chatwoot_webhook(req: Request):
     return {"attempt_id": attempt_id}
 
 
+INPUT_VARIABLES = {"customer_name", "chat_context"}
+VARIABLE_LABELS = {
+    "issue_category": "Issue category",
+    "issue_resolved": "Issue resolved",
+    "callback_requested": "Callback requested",
+    "callback_time": "Callback time",
+    "customer_summary": "Summary",
+}
+
+
+def fmt_duration(duration) -> str:
+    if duration is None:
+        return "-"
+    try:
+        total = int(round(float(duration)))
+    except (TypeError, ValueError):
+        return str(duration)
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes} min {seconds} sec" if minutes else f"{seconds} sec"
+
+
+def fmt_variables(variables) -> list[str]:
+    """Collected/output variables only, one 'Label: value' line each.
+    Input variables (customer_name, chat_context) are skipped: Sarvam
+    echoes them back and the chat_context blob wrecks the formatting."""
+    if not variables:
+        return []
+    lines = []
+    for key, value in variables.items():
+        if key in INPUT_VARIABLES or value in (None, ""):
+            continue
+        label = VARIABLE_LABELS.get(key, key.replace("_", " ").capitalize())
+        lines.append(f"- {label}: {value}")
+    return lines
+
+
+def fmt_transcript(transcript) -> list[str]:
+    """Sarvam transcript turns carry their text in 'en_text', not
+    'content' - reading 'content' silently produced empty turns."""
+    if not transcript:
+        return []
+    lines = []
+    for turn in transcript:
+        if not isinstance(turn, dict):
+            continue
+        text = turn.get("en_text") or turn.get("content") or turn.get("text") or ""
+        if not text:
+            continue
+        speaker = "Agent" if turn.get("role") == "agent" else "Customer"
+        lines.append(f"{speaker}: {text}")
+    return lines
+
+
+def build_call_summary(status, duration, variables, transcript, failure_reason=None) -> str:
+    lines = ["AI call completed",
+             f"Status: {status}",
+             f"Duration: {fmt_duration(duration)}"]
+    if failure_reason:
+        lines.append(f"Failure reason: {failure_reason}")
+    variable_lines = fmt_variables(variables)
+    if variable_lines:
+        lines.append("")
+        lines.append("Collected on call:")
+        lines.extend(variable_lines)
+    transcript_lines = fmt_transcript(transcript)
+    if transcript_lines:
+        lines.append("")
+        lines.append("Transcript:")
+        lines.extend(transcript_lines)
+    return "\n".join(lines)
+
+
 @app.post("/sarvam-webhook")
 async def sarvam_webhook(req: Request):
     """Sarvam posts here after every call attempt, connected or not.
     Fields per Sarvam docs: status, duration, interaction_id,
-    interaction_transcript, final_agent_variables, webhook_config.metadata."""
+    interaction_transcript (turns with role + en_text),
+    final_agent_variables, webhook_config.metadata."""
     data = await req.json()
     meta = ((data.get("webhook_config") or {}).get("metadata") or {})
     conversation_id = meta.get("conversation_id")
@@ -132,16 +205,13 @@ async def sarvam_webhook(req: Request):
     duration = data.get("duration")
     transcript = data.get("interaction_transcript")
     variables = data.get("final_agent_variables")
-    lines = [f"AI call finished. Status: {status}. Duration: {duration}s."]
-    if variables:
-        lines.append(f"Collected on call: {variables}")
-    if transcript:
-        turns = "\n".join(f"- {t.get('role','')}: {t.get('content','')}" for t in transcript)
-        lines.append(f"Transcript:\n{turns}")
+    summary = build_call_summary(status, duration, variables, transcript,
+                                 data.get("failure_reason"))
     CALL_RESULTS[int(conversation_id)] = {
         "status": status, "duration": duration, "variables": variables,
+        "summary": summary,
     }
-    cw_post_note(account_id, int(conversation_id), "\n".join(lines))
+    cw_post_note(account_id, int(conversation_id), summary)
     cw_add_labels(account_id, int(conversation_id), [f"call-{status}"])
     return {"ok": True}
 
@@ -167,13 +237,13 @@ input:focus { border-color:#1f93ff; }
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v8 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v9 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v8, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v9, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
@@ -210,7 +280,7 @@ async function poll() {
   const r = await fetch("/call-status?conversation_id=" + ctx.conversation.id);
   const j = await r.json();
   if (j.found) document.getElementById("result").textContent =
-    "Last call: " + j.status + ", " + j.duration + "s\nCollected: " + JSON.stringify(j.variables);
+    j.summary || ("Last call: " + j.status);
   else setTimeout(poll, 4000);
 }
 document.getElementById("callBtn").onclick = async () => {
