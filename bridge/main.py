@@ -41,18 +41,27 @@ def cw_post_note(account_id: int, conversation_id: int, content: str):
     return r.json()
 
 
-def fetch_recording_bytes(interaction_id: str, attempts: int = 8, delay: int = 15):
+def fetch_recording_bytes(interaction_id: str, app_id: str = None,
+                          attempts: int = 12, delay: int = 20):
     """Download the call recording (WAV) from Sarvam's Analytics API.
-    The stitched recording is produced after hangup and may not exist
-    the moment the webhook fires, so retry for a few minutes."""
+    The stitched recording is produced after hangup and Sarvam answers
+    404 until it exists ('No recording was found for this interaction'),
+    so retry patiently for several minutes. Uses the app_id Sarvam sent
+    in the webhook when available - the recording is scoped to the
+    agent that actually handled the call."""
     url = (f"https://apps.sarvam.ai/api/analytics/v1/{SARVAM_ORG}/{SARVAM_WS}/"
-           f"{SARVAM_APP_ID}/recordings/{quote(str(interaction_id), safe='')}")
+           f"{app_id or SARVAM_APP_ID}/recordings/{quote(str(interaction_id), safe='')}")
     for i in range(attempts):
         try:
             r = requests.get(url, headers={"X-API-Key": SARVAM_KEY}, timeout=60)
             if r.status_code == 200 and r.content:
                 return r.content
-            print(f"[recording] attempt {i + 1}: HTTP {r.status_code}, retrying")
+            detail = ""
+            try:
+                detail = (r.text or "")[:200]
+            except Exception:
+                pass
+            print(f"[recording] attempt {i + 1}: HTTP {r.status_code} {detail}, retrying")
         except requests.RequestException as e:
             print(f"[recording] attempt {i + 1} failed: {e}")
         if i < attempts - 1:
@@ -73,11 +82,12 @@ def cw_post_note_with_audio(account_id: int, conversation_id: int, content: str,
     return r.json()
 
 
-def attach_recording_later(account_id: int, conversation_id: int, interaction_id: str):
+def attach_recording_later(account_id: int, conversation_id: int,
+                           interaction_id: str, app_id: str = None):
     """Background thread: wait for Sarvam to finish stitching the
     recording, download it, and attach it to the conversation."""
     time.sleep(20)
-    wav = fetch_recording_bytes(interaction_id)
+    wav = fetch_recording_bytes(interaction_id, app_id)
     if not wav:
         print(f"[recording] giving up for conversation {conversation_id}: "
               "recording never became available")
@@ -276,7 +286,8 @@ async def sarvam_webhook(req: Request):
     interaction_id = data.get("interaction_id")
     if interaction_id:
         threading.Thread(target=attach_recording_later,
-                         args=(account_id, int(conversation_id), interaction_id),
+                         args=(account_id, int(conversation_id), interaction_id,
+                               data.get("app_id")),
                          daemon=True).start()
     return {"ok": True}
 
@@ -302,13 +313,13 @@ input:focus { border-color:#1f93ff; }
 <button id="callBtn" disabled style="margin-top:10px;padding:10px 14px;font-size:15px">
   Call customer with AI agent</button>
 <div id="result" style="margin-top:10px;white-space:pre-wrap"></div>
-<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v10 loaded, no messages yet</div>
+<div id="debug" style="margin-top:12px;font-size:11px;color:#7d7e85;white-space:pre-wrap">debug: panel v11 loaded, no messages yet</div>
 <script>
 let ctx = null;
 let msgCount = 0, fetchCount = 0;
 function dbg(extra) {
   document.getElementById("debug").textContent =
-    "debug: panel v10, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
+    "debug: panel v11, messages heard: " + msgCount + ", context requests sent: " + fetchCount + (extra ? "\n" + extra : "");
 }
 window.addEventListener("message", function (e) {
   msgCount++;
