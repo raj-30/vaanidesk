@@ -1,5 +1,5 @@
 """
-Chatwoot <-> Sarvam Samvaad bridge. (v12)
+Chatwoot <-> Sarvam Samvaad bridge. (v13)
 Run:  uvicorn main:app --host 0.0.0.0 --port 8000
 Flow:
   Chatwoot automation/webhook --(label 'call-me' added)--> POST /chatwoot-webhook
@@ -16,10 +16,23 @@ v12 adds:
   - AI summaries: optional LLM layer (Mercury 3 by default, any
     OpenAI-compatible provider via AI_* env vars) that posts a
     structured post-call summary note and feeds the panel.
+v13 adds:
+  - Inbound fix: Chatwoot v4 wraps a created contact as
+    {payload: {contact: {...}}} - the bridge now unwraps it
+    (v12 crashed with KeyError: 'id'), and the inbound handler
+    can no longer 500 back to Sarvam.
+  - Callback scheduler: if the customer asks on a call for a
+    callback at a specific time, the AI resolves the moment and
+    the bridge calls back automatically (callbacks.json).
+  - After an outbound call, the customer gets a confirmation
+    message in the chat: what was noted + that their request is
+    being processed.
 """
+import json
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -167,13 +180,32 @@ def cw_find_contact_by_phone(account_id: int, phone: str):
     return None
 
 
+def _unwrap(body, *keys):
+    """Dig through Chatwoot's response wrappers and return the
+    innermost dict holding any of the wanted keys. Chatwoot v4 wraps
+    a created contact as {payload: {contact: {...}, contact_inbox:
+    {...}}}, while other endpoints answer flat - both are handled."""
+    cur = body if isinstance(body, dict) else {}
+    for _ in range(3):
+        if any(k in cur for k in keys):
+            return cur
+        nxt = None
+        for wrapper in ("payload", "contact", "contact_inbox", "conversation"):
+            if isinstance(cur.get(wrapper), dict):
+                nxt = cur[wrapper]
+                break
+        if nxt is None:
+            return cur
+        cur = nxt
+    return cur
+
+
 def cw_create_contact(account_id: int, name: str, phone: str):
     url = f"{CHATWOOT_URL}/api/v1/accounts/{account_id}/contacts"
     r = requests.post(url, headers=CW_HEADERS,
                       json={"name": name, "phone_number": phone}, timeout=30)
     r.raise_for_status()
-    body = r.json()
-    return body.get("payload") or body
+    return _unwrap(r.json(), "id", "phone_number")
 
 
 def cw_create_contact_inbox(account_id: int, contact_id: int, inbox_id: int):
@@ -183,8 +215,7 @@ def cw_create_contact_inbox(account_id: int, contact_id: int, inbox_id: int):
            f"/contacts/{contact_id}/contact_inboxes")
     r = requests.post(url, headers=CW_HEADERS, json={"inbox_id": inbox_id}, timeout=30)
     r.raise_for_status()
-    body = r.json()
-    return body.get("payload") or body
+    return _unwrap(r.json(), "source_id")
 
 
 def cw_create_conversation(account_id: int, source_id: str, inbox_id: int,
@@ -195,8 +226,7 @@ def cw_create_conversation(account_id: int, source_id: str, inbox_id: int,
         body["additional_attributes"] = additional_attributes
     r = requests.post(url, headers=CW_HEADERS, json=body, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    return data.get("payload") or data
+    return _unwrap(r.json(), "id")
 
 
 def cw_get_chat_context(account_id: int, conversation_id: int, max_messages: int = 10) -> str:
@@ -269,7 +299,8 @@ async def chatwoot_webhook(req: Request):
                  f"AI call started to {phone}. Sarvam attempt_id: {attempt_id}")
     cw_add_labels(account_id, conversation_id, ["call-started"])
     CALL_RESULTS[int(conversation_id)] = {"status": "started", "live": True,
-                                          "started_at": time.time(), "phone": phone}
+                                          "started_at": time.time(), "phone": phone,
+                                          "name": sender.get("name")}
     return {"attempt_id": attempt_id}
 
 
@@ -345,18 +376,35 @@ def build_call_summary(status, duration, variables, transcript, failure_reason=N
     return "\n".join(lines)
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _fmt_ist(when) -> str:
+    """Human time for notes and messages, always IST."""
+    if isinstance(when, (int, float)):
+        dt = datetime.fromtimestamp(when, IST)
+    else:
+        dt = when.astimezone(IST)
+    return dt.strftime("%d %b %Y, %I:%M %p IST")
+
+
 def ai_summarize_call(status, duration, variables, transcript):
     """Ask the configured LLM for a structured post-call summary.
     Returns (formatted_text, raw_dict), or (None, None) when the AI
     layer is off (no AI_API_KEY) or anything goes wrong - the call
-    result itself must never depend on the AI provider being up."""
+    result itself must never depend on the AI provider being up.
+    v13: the model also resolves a requested callback moment
+    ('tomorrow 10 AM', 'in 2 hours') into an ISO timestamp the
+    scheduler below can act on."""
     if not AI_API_KEY:
         return None, None
     transcript_lines = fmt_transcript(transcript)
     if not transcript_lines:
         return None, None
     variable_lines = fmt_variables(variables)
+    now_ist = datetime.now(IST).strftime("%A, %d %B %Y, %I:%M %p IST")
     user_prompt = (
+        f"Current date and time in India: {now_ist}\n"
         f"Call status: {status}\n"
         f"Duration: {fmt_duration(duration)}\n"
         + ("Collected on call:\n" + "\n".join(variable_lines) + "\n" if variable_lines else "")
@@ -374,7 +422,10 @@ def ai_summarize_call(status, duration, variables, transcript):
                 "summary (2-3 plain lines), intent (short), "
                 "sentiment (positive, neutral or negative), "
                 "resolved (true or false), next_action (short, or 'None'), "
-                "followup_draft (a short polite follow-up message to the customer, or empty string).")},
+                "followup_draft (a short polite follow-up message to the customer, or empty string), "
+                "callback_requested (true only if the customer asked to be called back at a specific time), "
+                "callback_at (that moment as ISO 8601 with the +05:30 offset, resolved against the "
+                "current date and time given in the user message; null when no specific callback time was asked).")},
             {"role": "user", "content": user_prompt},
         ],
     }
@@ -391,8 +442,7 @@ def ai_summarize_call(status, duration, variables, transcript):
             if content.lower().startswith("json"):
                 content = content[4:]
             content = content.strip()
-        import json as _json
-        raw = _json.loads(content)
+        raw = json.loads(content)
     except Exception as e:
         print(f"[ai] summary failed: {e}")
         return None, None
@@ -414,24 +464,206 @@ def ai_summarize_call(status, duration, variables, transcript):
         lines.append(f"Next action: {raw['next_action']}")
     if raw.get("followup_draft"):
         lines.append(f"Follow-up draft: {raw['followup_draft']}")
+    if raw.get("callback_requested") and raw.get("callback_at"):
+        try:
+            due = datetime.fromisoformat(str(raw["callback_at"]).replace("Z", "+00:00"))
+            lines.append(f"Callback requested: {_fmt_ist(due)}")
+        except Exception:
+            pass
     return ("\n".join(lines) if lines else None), raw
 
 
-def ai_summary_later(account_id: int, conversation_id: int, status,
-                     duration, variables, transcript):
-    """Background thread: generate the AI summary, store it for the
-    panel (call-status) and post it as its own private note."""
-    text, _raw = ai_summarize_call(status, duration, variables, transcript)
-    if not text:
-        return
+# ---------------------------------------------------------------------------
+# Callback scheduler. When a customer asks on a call to be called back at
+# a specific time, the AI layer resolves that moment and the bridge stores
+# it in callbacks.json (survives restarts). A background thread checks
+# every 20 seconds and places due callbacks as normal outbound calls into
+# the SAME conversation, so the whole story stays in one thread.
+# ---------------------------------------------------------------------------
+CALLBACKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "callbacks.json")
+_PENDING_CALLBACKS = []
+_CALLBACKS_LOCK = threading.Lock()
+
+
+def _save_callbacks():
+    try:
+        with open(CALLBACKS_FILE, "w") as f:
+            json.dump(_PENDING_CALLBACKS, f)
+    except Exception as e:
+        print(f"[callback] could not save callbacks.json: {e}")
+
+
+def _load_callbacks():
+    global _PENDING_CALLBACKS
+    try:
+        with open(CALLBACKS_FILE) as f:
+            items = json.load(f)
+        _PENDING_CALLBACKS = [c for c in items
+                              if isinstance(c, dict) and c.get("due_at")]
+    except FileNotFoundError:
+        _PENDING_CALLBACKS = []
+    except Exception as e:
+        print(f"[callback] could not load callbacks.json: {e}")
+        _PENDING_CALLBACKS = []
+
+
+def schedule_callback(account_id, conversation_id, phone, name, due_epoch):
+    entry = {"account_id": int(account_id), "conversation_id": int(conversation_id),
+             "phone": phone, "name": name or "Customer", "due_at": float(due_epoch)}
+    with _CALLBACKS_LOCK:
+        _PENDING_CALLBACKS.append(entry)
+        _save_callbacks()
+    when = _fmt_ist(due_epoch)
     result = CALL_RESULTS.get(int(conversation_id))
     if result is not None:
-        result["ai_summary"] = text
+        result["callback_at"] = datetime.fromtimestamp(due_epoch, IST).isoformat()
     try:
-        cw_post_note(account_id, int(conversation_id), "AI summary\n" + text)
-        print(f"[ai] summary posted for conversation {conversation_id}")
+        cw_post_note(account_id, int(conversation_id),
+                     f"Callback scheduled: the customer asked to be called back on {when}. "
+                     "The bridge will place the call automatically.")
     except Exception as e:
-        print(f"[ai] posting summary note failed: {e}")
+        print(f"[callback] scheduling note failed: {e}")
+    print(f"[callback] scheduled for conversation {conversation_id} at {when}")
+    return when
+
+
+def _maybe_schedule_callback(account_id, conversation_id, variables, raw):
+    """Turn the AI's extracted callback moment into a scheduled call.
+    Returns the human-readable moment, or None when there is nothing
+    valid to schedule."""
+    if not raw or not raw.get("callback_requested") or not raw.get("callback_at"):
+        return None
+    try:
+        due = datetime.fromisoformat(str(raw["callback_at"]).replace("Z", "+00:00"))
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=IST)
+        due_epoch = due.timestamp()
+    except Exception as e:
+        print(f"[callback] unparseable callback_at {raw.get('callback_at')!r}: {e}")
+        return None
+    now = time.time()
+    if not (now + 30 <= due_epoch <= now + 7 * 24 * 3600):
+        print(f"[callback] callback_at outside the allowed window: {raw.get('callback_at')}")
+        return None
+    with _CALLBACKS_LOCK:
+        for existing in _PENDING_CALLBACKS:
+            if (existing.get("conversation_id") == int(conversation_id)
+                    and abs(existing.get("due_at", 0) - due_epoch) < 600):
+                print(f"[callback] already scheduled for conversation {conversation_id}")
+                return _fmt_ist(existing["due_at"])
+    result = CALL_RESULTS.get(int(conversation_id)) or {}
+    phone = result.get("phone")
+    name = (variables or {}).get("customer_name") or result.get("name")
+    if not phone:
+        print(f"[callback] no phone known for conversation {conversation_id}; cannot schedule")
+        return None
+    return schedule_callback(account_id, conversation_id, phone, name, due_epoch)
+
+
+def _fire_callback(entry):
+    account_id = entry["account_id"]
+    conversation_id = entry["conversation_id"]
+    phone = entry["phone"]
+    name = entry.get("name") or "Customer"
+    chat_context = cw_get_chat_context(account_id, conversation_id)
+    variables = {"customer_name": name,
+                 "chat_context": chat_context or "This is the callback the customer requested earlier."}
+    try:
+        attempt_id = start_sarvam_call(phone, conversation_id, variables, account_id)
+    except Exception as e:
+        print(f"[callback] firing failed for conversation {conversation_id}: {e}")
+        try:
+            cw_post_note(account_id, conversation_id,
+                         f"Scheduled callback could NOT be placed ({e}). "
+                         "Please call the customer manually.")
+        except Exception:
+            pass
+        return
+    CALL_RESULTS[conversation_id] = {"status": "started", "live": True,
+                                     "started_at": time.time(),
+                                     "phone": phone, "name": name}
+    try:
+        cw_post_note(account_id, conversation_id,
+                     f"Scheduled callback started to {phone}. Attempt: {attempt_id}")
+        cw_add_labels(account_id, conversation_id, ["call-started", "call-callback"])
+    except Exception as e:
+        print(f"[callback] post-fire note failed: {e}")
+    print(f"[callback] fired for conversation {conversation_id}, attempt {attempt_id}")
+
+
+def _callback_scheduler_loop():
+    while True:
+        try:
+            now = time.time()
+            due = []
+            with _CALLBACKS_LOCK:
+                remaining = []
+                for entry in _PENDING_CALLBACKS:
+                    (due if entry.get("due_at", 0) <= now else remaining).append(entry)
+                if due:
+                    _PENDING_CALLBACKS[:] = remaining
+                    _save_callbacks()
+            for entry in due:
+                _fire_callback(entry)
+        except Exception as e:
+            print(f"[callback] scheduler loop error: {e}")
+        time.sleep(20)
+
+
+_load_callbacks()
+threading.Thread(target=_callback_scheduler_loop, daemon=True).start()
+
+
+def build_customer_confirmation(variables, raw, callback_when=None):
+    """The kind message the customer sees in the chat after an outbound
+    call: what was noted, that their request is being processed, and
+    the callback moment if one was scheduled."""
+    name = (variables or {}).get("customer_name") or "there"
+    lines = [f"Hi {name}, thank you for speaking with VaaniDesk just now.", ""]
+    noted = []
+    if raw and raw.get("summary"):
+        noted.append(str(raw["summary"]))
+    else:
+        for line in fmt_variables(variables):
+            noted.append(line[2:] if line.startswith("- ") else line)
+    if noted:
+        lines.append("Here's what we noted from your call:")
+        lines.extend(noted)
+        lines.append("")
+    lines.append("We're processing your request and will update you right here. "
+                 "If anything changes, just reply to this chat.")
+    if callback_when:
+        lines.append("")
+        lines.append(f"As requested, we'll call you back on {callback_when}.")
+    return "\n".join(lines)
+
+
+def ai_summary_later(account_id: int, conversation_id: int, status,
+                     duration, variables, transcript, confirm_customer=False):
+    """Background thread: generate the AI summary, store it for the
+    panel (call-status) and post it as its own private note; schedule
+    a callback if the customer asked for one at a specific time; and
+    for outbound calls, send the customer a confirmation message in
+    the chat so they know they were heard."""
+    text, raw = ai_summarize_call(status, duration, variables, transcript)
+    if text:
+        result = CALL_RESULTS.get(int(conversation_id))
+        if result is not None:
+            result["ai_summary"] = text
+        try:
+            cw_post_note(account_id, int(conversation_id), "AI summary\n" + text)
+            print(f"[ai] summary posted for conversation {conversation_id}")
+        except Exception as e:
+            print(f"[ai] posting summary note failed: {e}")
+    callback_when = _maybe_schedule_callback(account_id, conversation_id, variables, raw)
+    if confirm_customer and status == "connected":
+        try:
+            cw_post_message(account_id, int(conversation_id),
+                            build_customer_confirmation(variables, raw, callback_when),
+                            private=False)
+            print(f"[ai] customer confirmation sent for conversation {conversation_id}")
+        except Exception as e:
+            print(f"[ai] customer confirmation failed: {e}")
 
 
 @app.post("/sarvam-webhook")
@@ -453,10 +685,13 @@ async def sarvam_webhook(req: Request):
     variables = data.get("final_agent_variables")
     summary = build_call_summary(status, duration, variables, transcript,
                                  data.get("failure_reason"))
+    _prev = CALL_RESULTS.get(int(conversation_id)) or {}
     CALL_RESULTS[int(conversation_id)] = {
         "status": status, "duration": duration, "variables": variables,
         "summary": summary, "failure_reason": data.get("failure_reason"),
         "live": False, "ended_at": time.time(),
+        "phone": _prev.get("phone"), "name": _prev.get("name"),
+        "callback_at": _prev.get("callback_at"),
     }
     cw_post_note(account_id, int(conversation_id), summary)
     cw_add_labels(account_id, int(conversation_id), [f"call-{status}"])
@@ -469,6 +704,7 @@ async def sarvam_webhook(req: Request):
     threading.Thread(target=ai_summary_later,
                      args=(account_id, int(conversation_id), status, duration,
                            variables, transcript),
+                     kwargs={"confirm_customer": True},
                      daemon=True).start()
     return {"ok": True}
 
@@ -494,6 +730,23 @@ def extract_caller_phone(data: dict):
 
 @app.post("/inbound-webhook")
 async def inbound_webhook(req: Request):
+    """Wrapper around the real handler: an inbound processing error
+    must never surface as a 500 to Sarvam (it would retry and
+    duplicate work). Log it, unmark the interaction so a genuine
+    retry can succeed, and still answer 200."""
+    data = await req.json()
+    try:
+        return await _inbound_webhook_impl(data)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        interaction_id = data.get("interaction_id")
+        if interaction_id:
+            PROCESSED_INTERACTIONS.discard(interaction_id)
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+async def _inbound_webhook_impl(data: dict):
     """Sarvam's inbound deployment posts here when a customer calls
     the agent's number. An inbound call has no conversation waiting,
     so the bridge creates one: find-or-create the contact by caller
@@ -501,7 +754,6 @@ async def inbound_webhook(req: Request):
     the summary + transcript, label it, attach the recording, and run
     the AI summary - the same treatment outbound results get.
     Point the Samvaad inbound Webhook URL at <bridge>/inbound-webhook."""
-    data = await req.json()
     interaction_id = data.get("interaction_id")
     if interaction_id and interaction_id in PROCESSED_INTERACTIONS:
         return {"ok": True, "duplicate": True}
@@ -522,7 +774,16 @@ async def inbound_webhook(req: Request):
     contact = cw_find_contact_by_phone(account_id, phone)
     if not contact:
         contact = cw_create_contact(account_id, name, phone)
-    contact_inbox = cw_create_contact_inbox(account_id, int(contact["id"]),
+    contact_id = contact.get("id") if isinstance(contact, dict) else None
+    if not contact_id:
+        # The create/search shapes surprised us once already (v12
+        # KeyError: 'id'); search once more before giving up.
+        contact = cw_find_contact_by_phone(account_id, phone)
+        contact_id = contact.get("id") if isinstance(contact, dict) else None
+    if not contact_id:
+        print(f"[inbound] could not resolve a contact id for {phone}: {contact!r}")
+        return {"ok": False, "error": "could not resolve contact id"}
+    contact_inbox = cw_create_contact_inbox(account_id, int(contact_id),
                                             int(INBOUND_INBOX_ID))
     conversation = cw_create_conversation(account_id, contact_inbox["source_id"],
                                           int(INBOUND_INBOX_ID),
@@ -547,6 +808,7 @@ async def inbound_webhook(req: Request):
         "status": status, "duration": duration, "variables": variables,
         "summary": summary, "failure_reason": data.get("failure_reason"),
         "live": False, "ended_at": time.time(), "inbound": True,
+        "phone": phone, "name": name,
     }
     cw_post_note(account_id, conversation_id, summary)
     cw_add_labels(account_id, conversation_id, ["call-inbound", f"call-{status}"])
@@ -564,14 +826,15 @@ async def inbound_webhook(req: Request):
 
 @app.get("/panel", response_class=HTMLResponse)
 def panel():
-    """Chatwoot Dashboard App (panel v12). Register this URL in
+    """Chatwoot Dashboard App (panel v13). Register this URL in
     Chatwoot: Settings > Integrations > Dashboard Apps > Add.
     It appears as a tab inside every conversation.
     Chatwoot sends conversation+contact context via postMessage.
     While a call runs it shows the live in-progress state with an
     elapsed clock; when Sarvam's result lands it flips to the final
     outcome (connected / busy / not reachable / failed) with the
-    collected details, the result summary and the AI summary."""
+    collected details, the result summary, the AI summary and any
+    scheduled callback."""
     return r"""
 <!doctype html>
 <html>
@@ -697,7 +960,7 @@ def panel():
   <div class="empty">No calls yet in this conversation.<br>When a call finishes, its outcome, the details the agent collected, and the summary will appear here — the same result is also saved as a private note in the chat.</div>
 </div>
 
-<div class="foot">VaaniDesk bridge · panel v12</div>
+<div class="foot">VaaniDesk bridge · panel v13</div>
 
 <script>
 let ctx = null;
@@ -844,6 +1107,16 @@ function renderResult(j){
     row.appendChild(kk); row.appendChild(vv); kv.appendChild(row);
   });
 
+  if(j.callback_at){
+    const row = document.createElement("div"); row.className = "kv";
+    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = "Callback scheduled";
+    const vv = document.createElement("div"); vv.className = "v";
+    const d = new Date(j.callback_at);
+    vv.textContent = isNaN(d) ? String(j.callback_at)
+      : d.toLocaleString([], {day: "numeric", month: "short", hour: "numeric", minute: "2-digit"});
+    row.appendChild(kk); row.appendChild(vv); kv.appendChild(row);
+  }
+
   if(j.failure_reason){
     const fr = $("failReason");
     fr.textContent = "Reason: " + j.failure_reason;
@@ -962,7 +1235,8 @@ async def trigger_call(req: Request):
                  f"AI call started to {phone} from dashboard button. Attempt: {attempt_id}")
     cw_add_labels(account_id, conversation_id, ["call-started"])
     CALL_RESULTS[conversation_id] = {"status": "started", "live": True,
-                                     "started_at": time.time(), "phone": phone}
+                                     "started_at": time.time(), "phone": phone,
+                                     "name": data.get("name")}
     return {"attempt_id": attempt_id}
 
 
