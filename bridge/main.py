@@ -568,13 +568,28 @@ def _fire_callback(entry):
     chat_context = cw_get_chat_context(account_id, conversation_id)
     variables = {"customer_name": name,
                  "chat_context": chat_context or "This is the callback the customer requested earlier."}
-    try:
-        attempt_id = start_sarvam_call(phone, conversation_id, variables, account_id)
-    except Exception as e:
-        print(f"[callback] firing failed for conversation {conversation_id}: {e}")
+    attempt_id = None
+    last_error = None
+    for try_no in range(1, 6):
+        try:
+            attempt_id = start_sarvam_call(phone, conversation_id, variables, account_id)
+            break
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # Transient network trouble (DNS hiccup, Wi-Fi reconnect,
+            # laptop waking): wait and retry instead of giving up.
+            last_error = e
+            print(f"[callback] fire attempt {try_no} for conversation "
+                  f"{conversation_id} hit a network error: {e}")
+            if try_no < 5:
+                time.sleep(45)
+        except Exception as e:
+            last_error = e
+            break
+    if attempt_id is None:
+        print(f"[callback] firing failed for conversation {conversation_id}: {last_error}")
         try:
             cw_post_note(account_id, conversation_id,
-                         f"Scheduled callback could NOT be placed ({e}). "
+                         f"Scheduled callback could NOT be placed ({last_error}). "
                          "Please call the customer manually.")
         except Exception:
             pass
